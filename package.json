@@ -1,0 +1,17 @@
+{
+  "name": "variational-sdk",
+  "version": "1.0.0",
+  "description": "Variational Exchange SDK for funding rate arbitrage",
+  "main": "src/arbitrageLive.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/arbitrageLive.js",
+    "build": "bun build.js"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "ws": "^8.14.0"
+  }
+}
