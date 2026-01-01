@@ -261,7 +261,7 @@ async function fetchArbitrageData() {
     }
   }
 
-  opportunities.sort((a, b) => Math.abs(b.dailyProfit) - Math.abs(a.dailyProfit));
+  opportunities.sort((a, b) => b.dailyProfit - a.dailyProfit);
 
   cachedData = opportunities;
   lastFetchTime = now;
