@@ -2,6 +2,34 @@ import { execSync } from 'child_process';
 
 // 全局变量存储browserFetch函数引用
 let _browserFetch = null;
+// 代理可用性缓存
+let _proxyAvailable = null;
+let _proxyCheckTime = 0;
+const PROXY_CHECK_INTERVAL = 60000; // 60秒重新检测一次
+
+/**
+ * 测试代理是否可用
+ * @returns {boolean}
+ */
+function testProxyConnection() {
+  const now = Date.now();
+  // 使用缓存结果，避免频繁检测
+  if (_proxyAvailable !== null && now - _proxyCheckTime < PROXY_CHECK_INTERVAL) {
+    return _proxyAvailable;
+  }
+
+  try {
+    execSync(
+      'curl -s -x http://127.0.0.1:10809 --connect-timeout 3 -o /dev/null -w "%{http_code}" https://www.google.com',
+      { encoding: 'utf-8', timeout: 5000 }
+    );
+    _proxyAvailable = true;
+  } catch {
+    _proxyAvailable = false;
+  }
+  _proxyCheckTime = now;
+  return _proxyAvailable;
+}
 
 /**
  * 设置浏览器fetch函数（由wsServer设置）
@@ -17,7 +45,9 @@ export function setBrowserFetch(fn) {
  */
 export function fetchJsonCurl(url, useProxy = true) {
   try {
-    const proxyArg = useProxy ? '-x http://127.0.0.1:10809' : '';
+    // 如果需要代理，先测试代理是否可用
+    const actualUseProxy = useProxy && testProxyConnection();
+    const proxyArg = actualUseProxy ? '-x http://127.0.0.1:10809' : '';
     const result = execSync(
       `curl -s ${proxyArg} "${url}" \
         -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
