@@ -186,7 +186,7 @@ async function handleCommand(message) {
 
     let text = '<b>📊 日收益 Top5 套利对</b>\n\n';
     top5.forEach((o, i) => {
-      const profit = o.timeline.finalProfit;
+      const profit = o.dailyProfit / 10000 * 100; // 日收益率 %
       const emoji = profit >= 0.1 ? '🔥' : profit >= 0.05 ? '✨' : '📈';
       text += `${i + 1}. ${emoji} <b>${o.symbol}</b>\n`;
       text += `   日收益: <b>${profit >= 0 ? '+' : ''}${profit.toFixed(4)}%</b>\n`;
@@ -208,7 +208,7 @@ export async function checkAndNotify(opportunities) {
     for (const opp of opportunities) {
       if (opp.direction === 'NONE') continue;
 
-      const profit = opp.timeline.finalProfit; // 日收益率 %
+      const profit = opp.dailyProfit / 10000 * 100; // 日收益率 %
       const symbol = opp.symbol;
 
       if (triggered[symbol]) {
