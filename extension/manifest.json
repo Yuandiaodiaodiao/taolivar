@@ -1,13 +1,21 @@
 {
   "manifest_version": 3,
   "name": "Variational WS Proxy",
-  "version": "1.0",
-  "description": "保存原生WebSocket并注入代理脚本",
+  "version": "1.1",
+  "description": "保存原生WebSocket并通过background连接本地服务器",
   "permissions": [],
   "host_permissions": [
     "https://omni.variational.io/*"
   ],
+  "background": {
+    "service_worker": "background.js"
+  },
   "content_scripts": [
+    {
+      "matches": ["https://omni.variational.io/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    },
     {
       "matches": ["https://omni.variational.io/*"],
       "js": ["inject.js"],

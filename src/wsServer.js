@@ -112,10 +112,10 @@ export function isBrowserConnected() {
 }
 
 /**
- * 等待浏览器连接
+ * 等待浏览器连接（无限等待）
  */
-export function waitForBrowser(timeout = 120000) {
-  return new Promise((resolve, reject) => {
+export function waitForBrowser() {
+  return new Promise((resolve) => {
     if (isBrowserConnected()) {
       resolve();
       return;
@@ -124,15 +124,9 @@ export function waitForBrowser(timeout = 120000) {
     const checkInterval = setInterval(() => {
       if (isBrowserConnected()) {
         clearInterval(checkInterval);
-        clearTimeout(timer);
         resolve();
       }
     }, 100);
-
-    const timer = setTimeout(() => {
-      clearInterval(checkInterval);
-      reject(new Error('等待浏览器连接超时'));
-    }, timeout);
   });
 }
 
