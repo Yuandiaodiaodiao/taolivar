@@ -9,6 +9,7 @@ import {
   calculateArbitrageProfit,
   generateArbitrageTimeline,
 } from './fundingUtils.js';
+import { startBot, checkAndNotify, handleListRequests } from './bot.js';
 
 const HTTP_PORT = 10241;
 const VAR_API = 'https://omni.variational.io/api/metadata/supported_assets';
@@ -491,8 +492,12 @@ async function refreshDataPeriodically() {
     console.log(`[AUTO] 开始定时刷新数据...`);
     // 强制刷新缓存
     lastFetchTime = 0;
-    await fetchArbitrageData();
+    const opportunities = await fetchArbitrageData();
     console.log(`[AUTO] 数据刷新完成 - ${new Date().toLocaleTimeString()}`);
+
+    // 处理 Telegram 机器人通知
+    await checkAndNotify(opportunities);
+    await handleListRequests(opportunities);
   } catch (err) {
     console.error(`[AUTO] 定时刷新失败: ${err.message}`);
   }
@@ -502,6 +507,9 @@ async function main() {
   console.log('等待浏览器连接...\n');
   await waitForBrowser(120000);
   console.log('浏览器已连接!\n');
+
+  // 启动 Telegram 机器人
+  startBot();
 
   // 初始拉取一次数据
   await refreshDataPeriodically();
