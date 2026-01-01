@@ -13,6 +13,7 @@ export function setOpportunitiesGetter(fn) {
 }
 const SUBSCRIPTIONS_FILE = path.join(__dirname, '../subscriptions.json');
 const BOT_TOKEN = process.env.BOT_TOKEN;
+console.log('BOT_TOKEN=',BOT_TOKEN);
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 // 订阅数据结构: { chatId: { trigger: 0.1, exit: 0.01, triggered: { symbol: true } } }
