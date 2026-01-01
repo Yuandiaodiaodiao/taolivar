@@ -1,5 +1,5 @@
 import { createServer } from 'http';
-import { browserFetch, waitForBrowser } from './wsServer.js';
+import { browserFetch, waitForBrowser, isBrowserConnected } from './wsServer.js';
 import { fetchJsonCurl } from './httpClient.js';
 import {
   to8HourRate,
@@ -17,38 +17,55 @@ const BINANCE_API = 'https://fapi.binance.com/fapi/v1/premiumIndex';
 let cachedData = null;
 let lastFetchTime = 0;
 const CACHE_TTL = 30000;
+const AUTO_REFRESH_INTERVAL = 5 * 60 * 1000; // 5分钟自动刷新
 
 let lastVarRefreshTime = null;
 let lastBinanceRefreshTime = null;
 
-async function getVariationalAssets() {
-  const allAssets = await browserFetch(VAR_API);
-  const perpAssets = [];
+async function getVariationalAssets(maxRetries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      if (!isBrowserConnected()) {
+        console.log('[VAR] 浏览器未连接，等待重连...');
+        await waitForBrowser();
+        console.log('[VAR] 浏览器已重连');
+      }
+      const allAssets = await browserFetch(VAR_API);
+      const perpAssets = [];
 
-  for (const [symbol, assets] of Object.entries(allAssets)) {
-    for (const asset of assets) {
-      if (asset.has_perp && !asset.is_close_only_mode) {
-        const annualRate = parseFloat(asset.funding_rate) * 100;
-        // API返回年化费率(小数形式)，乘100转百分比，再转换为单次interval费率
-        // 单次费率 = 年化费率 * interval秒 / 年秒数
-        const intervalSeconds = asset.funding_interval_s;
-        const singleRate = annualRate * intervalSeconds / (365 * 24 * 3600);
+      for (const [symbol, assets] of Object.entries(allAssets)) {
+        for (const asset of assets) {
+          if (asset.has_perp && !asset.is_close_only_mode) {
+            const annualRate = parseFloat(asset.funding_rate) * 100;
+            const intervalSeconds = asset.funding_interval_s;
+            const singleRate = annualRate * intervalSeconds / (365 * 24 * 3600);
 
-        perpAssets.push({
-          symbol: asset.asset,
-          name: asset.name,
-          price: parseFloat(asset.price),
-          fundingRate: singleRate,
-          fundingIntervalSeconds: intervalSeconds,
-          fundingTime: asset.funding_time,
-          volume24h: parseFloat(asset.volume_24h || 0),
-        });
+            perpAssets.push({
+              symbol: asset.asset,
+              name: asset.name,
+              price: parseFloat(asset.price),
+              fundingRate: singleRate,
+              fundingIntervalSeconds: intervalSeconds,
+              fundingTime: asset.funding_time,
+              volume24h: parseFloat(asset.volume_24h || 0),
+            });
+          }
+        }
+      }
+
+      lastVarRefreshTime = new Date();
+      return perpAssets;
+    } catch (err) {
+      lastError = err;
+      console.log(`[VAR] 请求失败 (${attempt}/${maxRetries}): ${err.message}`);
+      if (attempt < maxRetries) {
+        console.log('[VAR] 等待浏览器重连...');
+        await waitForBrowser();
       }
     }
   }
-
-  lastVarRefreshTime = new Date();
-  return perpAssets;
+  throw lastError;
 }
 
 function getBinanceRates() {
@@ -218,9 +235,10 @@ function generateHTML(opportunities) {
 <body>
   <h1>Variational vs Binance 套利看板</h1>
   <div class="info">
-    VAR刷新: ${lastVarRefreshTime ? lastVarRefreshTime.toLocaleTimeString() : '-'} |
-    Binance刷新: ${lastBinanceRefreshTime ? lastBinanceRefreshTime.toLocaleTimeString() : '-'} |
-    共 ${opportunities.length} 个交易对 | 点击行查看时间线详情
+    VAR刷新: <span id="var-time">${lastVarRefreshTime ? lastVarRefreshTime.toLocaleTimeString() : '-'}</span> |
+    Binance刷新: <span id="binance-time">${lastBinanceRefreshTime ? lastBinanceRefreshTime.toLocaleTimeString() : '-'}</span> |
+    共 <span id="pair-count">${opportunities.length}</span> 个交易对 |
+    <span id="countdown">30</span>秒后刷新 | 点击行查看时间线详情
   </div>
   <div class="search">
     <input type="text" id="search" placeholder="搜索交易对..." onkeyup="filter()">
@@ -299,6 +317,10 @@ function generateHTML(opportunities) {
     </tbody>
   </table>
   <script>
+    const REFRESH_INTERVAL = 30; // 前端每30秒拉取一次缓存
+    let countdown = REFRESH_INTERVAL;
+    let allData = [];
+
     function filter() {
       const q = document.getElementById('search').value.toLowerCase();
       const rows = document.querySelectorAll('#table tbody tr.main-row');
@@ -309,12 +331,101 @@ function generateHTML(opportunities) {
         if (!show) timelineRow.classList.remove('show');
       });
     }
+
     function toggleTimeline(idx) {
       const row = document.querySelector('[data-idx="' + idx + '"]');
       const timeline = document.getElementById('timeline-' + idx);
       row.classList.toggle('expanded');
       timeline.classList.toggle('show');
     }
+
+    function formatIntervalShort(seconds) {
+      if (seconds >= 86400) return (seconds / 86400) + 'd';
+      if (seconds >= 3600) return (seconds / 3600) + 'h';
+      return seconds + 's';
+    }
+
+    function generateTimelineRows(timeline) {
+      const maxRows = 50;
+      const rows = timeline.slice(0, maxRows);
+      return rows.map(t => {
+        const eventClass = t.event === 'OPEN' ? 'event-open' : (t.event === 'VAR' ? 'event-var' : 'event-binance');
+        return '<tr>' +
+          '<td>' + t.timeText + '</td>' +
+          '<td class="' + eventClass + '">' + t.description + '</td>' +
+          '<td class="' + (t.varFunding >= 0 ? 'positive' : 'negative') + '">' + (t.varFunding !== 0 ? (t.varFunding >= 0 ? '+' : '') + t.varFunding.toFixed(4) + '%' : '-') + '</td>' +
+          '<td class="' + (t.binanceFunding >= 0 ? 'positive' : 'negative') + '">' + (t.binanceFunding !== 0 ? (t.binanceFunding >= 0 ? '+' : '') + t.binanceFunding.toFixed(4) + '%' : '-') + '</td>' +
+          '<td class="' + ((t.netFunding + t.spreadProfit) >= 0 ? 'positive' : 'negative') + '">' + ((t.netFunding + t.spreadProfit) >= 0 ? '+' : '') + (t.netFunding + t.spreadProfit).toFixed(4) + '%</td>' +
+          '<td class="' + (t.cumulativeProfit >= 0 ? 'positive' : 'negative') + '">' + (t.cumulativeProfit >= 0 ? '+' : '') + t.cumulativeProfit.toFixed(4) + '%</td>' +
+          '</tr>';
+      }).join('') + (timeline.length > maxRows ? '<tr><td colspan="6" style="text-align:center;color:#888;">... 还有 ' + (timeline.length - maxRows) + ' 条记录</td></tr>' : '');
+    }
+
+    function renderTable(data) {
+      const tbody = document.querySelector('#table tbody');
+      tbody.innerHTML = data.map((o, idx) => {
+        const isHot = Math.abs(o.annualDiff) > 50;
+        const hasOpp = o.direction !== 'NONE';
+        const varIntervalText = formatIntervalShort(o.varInterval);
+        const binanceIntervalText = formatIntervalShort(o.binanceInterval);
+        return '<tr class="main-row ' + (isHot ? 'hot' : '') + '" data-symbol="' + o.symbol.toLowerCase() + '" data-idx="' + idx + '" onclick="toggleTimeline(' + idx + ')">' +
+          '<td><span class="expand-icon">▶</span><strong>' + o.symbol + '</strong></td>' +
+          '<td>$' + o.varPrice.toFixed(4) + '</td>' +
+          '<td>$' + o.binancePrice.toFixed(4) + '</td>' +
+          '<td class="' + (o.varRate >= 0 ? 'positive' : 'negative') + '">' + (o.varRate >= 0 ? '+' : '') + o.varRate.toFixed(4) + '%<span class="interval-tag">' + varIntervalText + '</span></td>' +
+          '<td class="' + (o.binanceRate >= 0 ? 'positive' : 'negative') + '">' + (o.binanceRate >= 0 ? '+' : '') + o.binanceRate.toFixed(4) + '%<span class="interval-tag">' + binanceIntervalText + '</span></td>' +
+          '<td class="' + (o.timeline.finalProfit >= 0 ? 'positive' : 'negative') + '">' + (o.timeline.finalProfit >= 0 ? '+' : '') + o.timeline.finalProfit.toFixed(4) + '%</td>' +
+          '<td class="' + (o.annualDiff >= 0 ? 'positive' : 'negative') + '">' + (o.annualDiff >= 0 ? '+' : '') + o.annualDiff.toFixed(2) + '%</td>' +
+          '<td>' + (hasOpp ? '$' + o.profit.dailyProfit.toFixed(2) : '-') + '</td>' +
+          '<td class="' + (hasOpp ? 'strategy' : 'none') + '">' + o.strategy + '</td>' +
+          '</tr>' +
+          '<tr class="timeline-row" id="timeline-' + idx + '">' +
+          '<td colspan="9" class="timeline-cell">' +
+          '<div class="timeline-container">' +
+          '<div class="timeline-header">' +
+          '<div class="timeline-stat"><div class="timeline-stat-value ' + (o.timeline.lockedSpreadProfit >= 0 ? 'positive' : 'negative') + '">' + (o.timeline.lockedSpreadProfit >= 0 ? '+' : '') + o.timeline.lockedSpreadProfit.toFixed(4) + '%</div><div class="timeline-stat-label">锁定价差</div></div>' +
+          '<div class="timeline-stat"><div class="timeline-stat-value ' + (o.timeline.varTotalFunding >= 0 ? 'positive' : 'negative') + '">' + (o.timeline.varTotalFunding >= 0 ? '+' : '') + o.timeline.varTotalFunding.toFixed(4) + '%</div><div class="timeline-stat-label">VAR费率收益</div></div>' +
+          '<div class="timeline-stat"><div class="timeline-stat-value ' + (o.timeline.binanceTotalFunding >= 0 ? 'positive' : 'negative') + '">' + (o.timeline.binanceTotalFunding >= 0 ? '+' : '') + o.timeline.binanceTotalFunding.toFixed(4) + '%</div><div class="timeline-stat-label">Binance费率收益</div></div>' +
+          '<div class="timeline-stat"><div class="timeline-stat-value ' + (o.timeline.finalProfit >= 0 ? 'positive' : 'negative') + '">' + (o.timeline.finalProfit >= 0 ? '+' : '') + o.timeline.finalProfit.toFixed(4) + '%</div><div class="timeline-stat-label">24h总收益</div></div>' +
+          '</div>' +
+          '<table class="timeline-table"><thead><tr><th>时间</th><th>事件</th><th>VAR费率</th><th>Binance费率</th><th>本次净收益</th><th>累计收益</th></tr></thead>' +
+          '<tbody>' + generateTimelineRows(o.timeline.timeline) + '</tbody></table>' +
+          '</div></td></tr>';
+      }).join('');
+      document.getElementById('pair-count').textContent = data.length;
+      filter(); // 重新应用搜索过滤
+    }
+
+    async function fetchData() {
+      try {
+        const res = await fetch('/api/data');
+        const result = await res.json();
+        if (result.error) throw new Error(result.error);
+        allData = result.opportunities;
+        renderTable(result.opportunities);
+        // 更新真实的刷新时间
+        if (result.varRefreshTime) {
+          document.getElementById('var-time').textContent = new Date(result.varRefreshTime).toLocaleTimeString();
+        }
+        if (result.binanceRefreshTime) {
+          document.getElementById('binance-time').textContent = new Date(result.binanceRefreshTime).toLocaleTimeString();
+        }
+      } catch (err) {
+        console.error('刷新失败:', err);
+      }
+    }
+
+    function updateCountdown() {
+      countdown--;
+      if (countdown <= 0) {
+        countdown = REFRESH_INTERVAL;
+        fetchData();
+      }
+      document.getElementById('countdown').textContent = countdown;
+    }
+
+    // 启动定时器
+    setInterval(updateCountdown, 1000);
   </script>
 </body>
 </html>`;
@@ -359,7 +470,11 @@ function handleRequest(req, res) {
     fetchArbitrageData()
       .then(data => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(data));
+        res.end(JSON.stringify({
+          opportunities: data,
+          varRefreshTime: lastVarRefreshTime ? lastVarRefreshTime.toISOString() : null,
+          binanceRefreshTime: lastBinanceRefreshTime ? lastBinanceRefreshTime.toISOString() : null,
+        }));
       })
       .catch(err => {
         res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -371,10 +486,29 @@ function handleRequest(req, res) {
   }
 }
 
+async function refreshDataPeriodically() {
+  try {
+    console.log(`[AUTO] 开始定时刷新数据...`);
+    // 强制刷新缓存
+    lastFetchTime = 0;
+    await fetchArbitrageData();
+    console.log(`[AUTO] 数据刷新完成 - ${new Date().toLocaleTimeString()}`);
+  } catch (err) {
+    console.error(`[AUTO] 定时刷新失败: ${err.message}`);
+  }
+}
+
 async function main() {
   console.log('等待浏览器连接...\n');
   await waitForBrowser(120000);
   console.log('浏览器已连接!\n');
+
+  // 初始拉取一次数据
+  await refreshDataPeriodically();
+
+  // 启动定时刷新
+  setInterval(refreshDataPeriodically, AUTO_REFRESH_INTERVAL);
+  console.log(`[AUTO] 已启动定时刷新，间隔: ${AUTO_REFRESH_INTERVAL / 1000}秒\n`);
 
   const server = createServer(handleRequest);
   server.listen(HTTP_PORT, () => {
