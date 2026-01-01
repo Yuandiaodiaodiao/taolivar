@@ -9,7 +9,7 @@ import {
   calculateArbitrageProfit,
   generateArbitrageTimeline,
 } from './fundingUtils.js';
-import { startBot, checkAndNotify, handleListRequests } from './bot.js';
+import { startBot, checkAndNotify, setOpportunitiesGetter } from './bot.js';
 
 // 全局错误处理 - 防止进程崩溃
 process.on('uncaughtException', (err) => {
@@ -272,6 +272,11 @@ async function fetchArbitrageData() {
   lastFetchTime = now;
 
   return opportunities;
+}
+
+// 导出获取缓存数据的函数供 bot 使用
+export function getCachedOpportunities() {
+  return cachedData || [];
 }
 
 function generateHTML(opportunities) {
@@ -628,12 +633,6 @@ async function refreshDataPeriodically() {
     } catch (notifyErr) {
       console.error(`[AUTO] Telegram通知失败: ${notifyErr.message}`);
     }
-
-    try {
-      await handleListRequests(opportunities);
-    } catch (listErr) {
-      console.error(`[AUTO] 处理列表请求失败: ${listErr.message}`);
-    }
   } catch (err) {
     console.error(`[AUTO] 定时刷新失败: ${err.message}`);
     // 不抛出错误，确保定时任务继续运行
@@ -656,6 +655,8 @@ async function main() {
 
   // 启动 Telegram 机器人 - 捕获错误防止崩溃
   try {
+    // 注入获取缓存数据的函数
+    setOpportunitiesGetter(getCachedOpportunities);
     startBot();
   } catch (botErr) {
     console.error(`[MAIN] Telegram机器人启动失败: ${botErr.message}`);

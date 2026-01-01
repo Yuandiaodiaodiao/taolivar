@@ -3,6 +3,13 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// 缓存数据获取函数，由主程序注入
+let getOpportunitiesCallback = null;
+
+export function setOpportunitiesGetter(fn) {
+  getOpportunitiesCallback = fn;
+}
 const SUBSCRIPTIONS_FILE = path.join(__dirname, '../subscriptions.json');
 const BOT_TOKEN = process.env.BOT_TOKEN || '8586582661:AAGr3BVDjITqnjxuyqZ_rWTpVRsnW9GjCB0';
 const TG_API = `https://api.telegram.org/bot${BOT_TOKEN}`;
@@ -154,26 +161,25 @@ async function handleCommand(message) {
   }
 
   if (cmd === '/list') {
-    // 这个命令需要外部数据，标记一下让主程序处理
-    pendingListRequests.push(chatId);
-    return;
-  }
-}
+    // 直接使用缓存数据立刻返回
+    if (!getOpportunitiesCallback) {
+      await sendMessage(chatId, '数据尚未就绪，请稍后再试');
+      return;
+    }
 
-// 待处理的 /list 请求
-const pendingListRequests = [];
+    const opportunities = getOpportunitiesCallback();
+    if (!opportunities || opportunities.length === 0) {
+      await sendMessage(chatId, '暂无数据，请稍后再试');
+      return;
+    }
 
-// 处理 /list 请求（由主程序调用）
-export async function handleListRequests(opportunities) {
-  while (pendingListRequests.length > 0) {
-    const chatId = pendingListRequests.shift();
     const top5 = opportunities
       .filter(o => o.direction !== 'NONE')
       .slice(0, 5);
 
     if (top5.length === 0) {
       await sendMessage(chatId, '当前没有套利机会');
-      continue;
+      return;
     }
 
     let text = '<b>📊 日收益 Top5 套利对</b>\n\n';
@@ -187,8 +193,10 @@ export async function handleListRequests(opportunities) {
     });
 
     await sendMessage(chatId, text);
+    return;
   }
 }
+
 
 // 检查套利机会并推送（由主程序调用）
 export async function checkAndNotify(opportunities) {
