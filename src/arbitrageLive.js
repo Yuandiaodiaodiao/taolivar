@@ -6,7 +6,6 @@ import {
   toAnnualRate,
   formatInterval,
   getTimeToFunding,
-  calculateArbitrageProfit,
   generateArbitrageTimeline,
 } from './fundingUtils.js';
 import { startBot, checkAndNotify, setOpportunitiesGetter } from './bot.js';
@@ -219,15 +218,7 @@ async function fetchArbitrageData() {
         direction = 'NONE';
       }
 
-      const profit = calculateArbitrageProfit({
-        varRate: varAsset.fundingRate,
-        varInterval: varAsset.fundingIntervalSeconds,
-        binanceRate: binanceData.fundingRate,
-        binanceInterval: binanceData.fundingIntervalSeconds,
-        positionSize: 10000,
-        holdingDays: 1,
-      });
-
+      const positionSize = 10000;
       const timeline = generateArbitrageTimeline({
         varPrice: varAsset.price,
         binancePrice: binanceData.markPrice,
@@ -238,6 +229,9 @@ async function fetchArbitrageData() {
         direction,
         simulateDays: 1,
       });
+
+      // 使用24小时模拟的实际收益来计算日收益
+      const dailyProfit = (positionSize * timeline.finalProfit) / 100;
 
       opportunities.push({
         symbol,
@@ -257,7 +251,8 @@ async function fetchArbitrageData() {
         annualDiff,
         strategy,
         direction,
-        profit,
+        dailyProfit,
+        positionSize,
         timeline,
         volume24h: varAsset.volume24h,
       });
@@ -362,7 +357,7 @@ function generateHTML(opportunities) {
           <td class="${o.binanceRate >= 0 ? 'positive' : 'negative'}">${o.binanceRate >= 0 ? '+' : ''}${o.binanceRate.toFixed(4)}%<span class="interval-tag">${binanceIntervalText}</span></td>
           <td class="${o.timeline.finalProfit >= 0 ? 'positive' : 'negative'}">${o.timeline.finalProfit >= 0 ? '+' : ''}${o.timeline.finalProfit.toFixed(4)}%</td>
           <td class="${o.annualDiff >= 0 ? 'positive' : 'negative'}">${o.annualDiff >= 0 ? '+' : ''}${o.annualDiff.toFixed(2)}%</td>
-          <td>${hasOpp ? '$' + o.profit.dailyProfit.toFixed(2) : '-'}</td>
+          <td>${hasOpp ? '$' + o.dailyProfit.toFixed(2) : '-'}</td>
           <td class="${hasOpp ? 'strategy' : 'none'}">${o.strategy}</td>
         </tr>
         <tr class="timeline-row" id="timeline-${idx}">
@@ -467,7 +462,7 @@ function generateHTML(opportunities) {
           '<td class="' + (o.binanceRate >= 0 ? 'positive' : 'negative') + '">' + (o.binanceRate >= 0 ? '+' : '') + o.binanceRate.toFixed(4) + '%<span class="interval-tag">' + binanceIntervalText + '</span></td>' +
           '<td class="' + (o.timeline.finalProfit >= 0 ? 'positive' : 'negative') + '">' + (o.timeline.finalProfit >= 0 ? '+' : '') + o.timeline.finalProfit.toFixed(4) + '%</td>' +
           '<td class="' + (o.annualDiff >= 0 ? 'positive' : 'negative') + '">' + (o.annualDiff >= 0 ? '+' : '') + o.annualDiff.toFixed(2) + '%</td>' +
-          '<td>' + (hasOpp ? '$' + o.profit.dailyProfit.toFixed(2) : '-') + '</td>' +
+          '<td>' + (hasOpp ? '$' + o.dailyProfit.toFixed(2) : '-') + '</td>' +
           '<td class="' + (hasOpp ? 'strategy' : 'none') + '">' + o.strategy + '</td>' +
           '</tr>' +
           '<tr class="timeline-row" id="timeline-' + idx + '">' +
