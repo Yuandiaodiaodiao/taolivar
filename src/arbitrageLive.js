@@ -11,6 +11,27 @@ import {
 } from './fundingUtils.js';
 import { startBot, checkAndNotify, handleListRequests } from './bot.js';
 
+// 全局错误处理 - 防止进程崩溃
+process.on('uncaughtException', (err) => {
+  console.error(`[FATAL] 未捕获异常: ${err.message}`);
+  console.error(err.stack);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error(`[FATAL] 未处理的Promise拒绝:`, reason);
+});
+
+// 优雅关闭
+process.on('SIGINT', () => {
+  console.log('\n[SHUTDOWN] 收到 SIGINT，正在关闭...');
+  process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+  console.log('\n[SHUTDOWN] 收到 SIGTERM，正在关闭...');
+  process.exit(0);
+});
+
 const HTTP_PORT = 10241;
 const VAR_API = 'https://omni.variational.io/api/metadata/supported_assets';
 const BINANCE_API = 'https://fapi.binance.com/fapi/v1/premiumIndex';
@@ -35,22 +56,31 @@ async function getVariationalAssets(maxRetries = 3) {
       const allAssets = await browserFetch(VAR_API);
       const perpAssets = [];
 
-      for (const [symbol, assets] of Object.entries(allAssets)) {
-        for (const asset of assets) {
-          if (asset.has_perp && !asset.is_close_only_mode) {
-            const annualRate = parseFloat(asset.funding_rate) * 100;
-            const intervalSeconds = asset.funding_interval_s;
-            const singleRate = annualRate * intervalSeconds / (365 * 24 * 3600);
+      if (!allAssets || typeof allAssets !== 'object') {
+        throw new Error('VAR API 返回无效数据');
+      }
 
-            perpAssets.push({
-              symbol: asset.asset,
-              name: asset.name,
-              price: parseFloat(asset.price),
-              fundingRate: singleRate,
-              fundingIntervalSeconds: intervalSeconds,
-              fundingTime: asset.funding_time,
-              volume24h: parseFloat(asset.volume_24h || 0),
-            });
+      for (const [symbol, assets] of Object.entries(allAssets)) {
+        if (!Array.isArray(assets)) continue;
+        for (const asset of assets) {
+          try {
+            if (asset.has_perp && !asset.is_close_only_mode) {
+              const annualRate = parseFloat(asset.funding_rate) * 100 || 0;
+              const intervalSeconds = asset.funding_interval_s || 28800;
+              const singleRate = annualRate * intervalSeconds / (365 * 24 * 3600);
+
+              perpAssets.push({
+                symbol: asset.asset || symbol,
+                name: asset.name || symbol,
+                price: parseFloat(asset.price) || 0,
+                fundingRate: singleRate,
+                fundingIntervalSeconds: intervalSeconds,
+                fundingTime: asset.funding_time || null,
+                volume24h: parseFloat(asset.volume_24h || 0),
+              });
+            }
+          } catch (parseErr) {
+            console.error(`[VAR] 解析资产 ${symbol} 失败: ${parseErr.message}`);
           }
         }
       }
@@ -69,25 +99,45 @@ async function getVariationalAssets(maxRetries = 3) {
   throw lastError;
 }
 
-function getBinanceRates() {
-  const fundingInfo = fetchJsonCurl('https://fapi.binance.com/fapi/v1/fundingInfo');
-  const intervalMap = {};
-  for (const info of fundingInfo) {
-    intervalMap[info.symbol] = (info.fundingIntervalHours || 8) * 3600;
+function getBinanceRates(maxRetries = 3) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const fundingInfo = fetchJsonCurl('https://fapi.binance.com/fapi/v1/fundingInfo');
+      const intervalMap = {};
+      if (Array.isArray(fundingInfo)) {
+        for (const info of fundingInfo) {
+          intervalMap[info.symbol] = (info.fundingIntervalHours || 8) * 3600;
+        }
+      }
+
+      const data = fetchJsonCurl(BINANCE_API);
+      if (!Array.isArray(data)) {
+        throw new Error('Binance API 返回非数组数据');
+      }
+
+      const result = data.map(item => ({
+        symbol: item.symbol.replace('USDT', '').replace('USDC', ''),
+        markPrice: parseFloat(item.markPrice) || 0,
+        indexPrice: parseFloat(item.indexPrice) || 0,
+        fundingRate: parseFloat(item.lastFundingRate) * 100 || 0,
+        fundingTime: item.nextFundingTime ? new Date(item.nextFundingTime).toISOString() : null,
+        fundingIntervalSeconds: intervalMap[item.symbol] || 28800,
+      }));
+
+      lastBinanceRefreshTime = new Date();
+      return result;
+    } catch (err) {
+      lastError = err;
+      console.log(`[Binance] 请求失败 (${attempt}/${maxRetries}): ${err.message}`);
+      if (attempt < maxRetries) {
+        // 等待一秒后重试
+        const start = Date.now();
+        while (Date.now() - start < 1000) { /* busy wait */ }
+      }
+    }
   }
-
-  const data = fetchJsonCurl(BINANCE_API);
-  const result = data.map(item => ({
-    symbol: item.symbol.replace('USDT', '').replace('USDC', ''),
-    markPrice: parseFloat(item.markPrice),
-    indexPrice: parseFloat(item.indexPrice),
-    fundingRate: parseFloat(item.lastFundingRate) * 100,
-    fundingTime: new Date(item.nextFundingTime).toISOString(),
-    fundingIntervalSeconds: intervalMap[item.symbol] || 28800,
-  }));
-
-  lastBinanceRefreshTime = new Date();
-  return result;
+  throw lastError;
 }
 
 async function fetchArbitrageData() {
@@ -96,10 +146,41 @@ async function fetchArbitrageData() {
     return cachedData;
   }
 
-  const [varAssets, binanceRates] = await Promise.all([
+  let varAssets = [];
+  let binanceRates = [];
+
+  // 并行获取数据，单个失败不影响另一个
+  const results = await Promise.allSettled([
     getVariationalAssets(),
-    Promise.resolve(getBinanceRates()),
+    Promise.resolve().then(() => getBinanceRates()),
   ]);
+
+  if (results[0].status === 'fulfilled') {
+    varAssets = results[0].value;
+  } else {
+    console.error(`[DATA] VAR数据获取失败: ${results[0].reason?.message || results[0].reason}`);
+    // 如果有缓存，继续使用旧数据
+    if (cachedData) {
+      console.log('[DATA] 使用缓存的VAR数据');
+      return cachedData;
+    }
+  }
+
+  if (results[1].status === 'fulfilled') {
+    binanceRates = results[1].value;
+  } else {
+    console.error(`[DATA] Binance数据获取失败: ${results[1].reason?.message || results[1].reason}`);
+    // 如果有缓存，继续使用旧数据
+    if (cachedData) {
+      console.log('[DATA] 使用缓存的Binance数据');
+      return cachedData;
+    }
+  }
+
+  // 如果两个都失败且没有缓存，抛出错误
+  if (varAssets.length === 0 && binanceRates.length === 0) {
+    throw new Error('无法获取任何数据');
+  }
 
   const binanceRateMap = {};
   for (const rate of binanceRates) {
@@ -109,76 +190,80 @@ async function fetchArbitrageData() {
   const opportunities = [];
 
   for (const varAsset of varAssets) {
-    const symbol = varAsset.symbol;
-    const binanceData = binanceRateMap[symbol];
+    try {
+      const symbol = varAsset.symbol;
+      const binanceData = binanceRateMap[symbol];
 
-    if (!binanceData) continue;
+      if (!binanceData) continue;
 
-    const var8hRate = to8HourRate(varAsset.fundingRate, varAsset.fundingIntervalSeconds);
-    const binance8hRate = binanceData.fundingRate;
+      const var8hRate = to8HourRate(varAsset.fundingRate, varAsset.fundingIntervalSeconds);
+      const binance8hRate = binanceData.fundingRate || 0;
 
-    const varAnnualRate = toAnnualRate(varAsset.fundingRate, varAsset.fundingIntervalSeconds);
-    const binanceAnnualRate = toAnnualRate(binanceData.fundingRate, binanceData.fundingIntervalSeconds);
+      const varAnnualRate = toAnnualRate(varAsset.fundingRate, varAsset.fundingIntervalSeconds);
+      const binanceAnnualRate = toAnnualRate(binanceData.fundingRate, binanceData.fundingIntervalSeconds);
 
-    const rateDiff = var8hRate - binance8hRate;
-    const annualDiff = varAnnualRate - binanceAnnualRate;
+      const rateDiff = var8hRate - binance8hRate;
+      const annualDiff = varAnnualRate - binanceAnnualRate;
 
-    let strategy = '';
-    let direction = '';
+      let strategy = '';
+      let direction = '';
 
-    if (rateDiff > 0.01) {
-      strategy = 'VAR空 + Binance多';
-      direction = 'SHORT_VAR';
-    } else if (rateDiff < -0.01) {
-      strategy = 'Binance空 + VAR多';
-      direction = 'SHORT_BINANCE';
-    } else {
-      strategy = '无套利空间';
-      direction = 'NONE';
+      if (rateDiff > 0.01) {
+        strategy = 'VAR空 + Binance多';
+        direction = 'SHORT_VAR';
+      } else if (rateDiff < -0.01) {
+        strategy = 'Binance空 + VAR多';
+        direction = 'SHORT_BINANCE';
+      } else {
+        strategy = '无套利空间';
+        direction = 'NONE';
+      }
+
+      const profit = calculateArbitrageProfit({
+        varRate: varAsset.fundingRate,
+        varInterval: varAsset.fundingIntervalSeconds,
+        binanceRate: binanceData.fundingRate,
+        binanceInterval: binanceData.fundingIntervalSeconds,
+        positionSize: 10000,
+        holdingDays: 1,
+      });
+
+      const timeline = generateArbitrageTimeline({
+        varPrice: varAsset.price,
+        binancePrice: binanceData.markPrice,
+        varRate: varAsset.fundingRate,
+        varInterval: varAsset.fundingIntervalSeconds,
+        binanceRate: binanceData.fundingRate,
+        binanceInterval: binanceData.fundingIntervalSeconds,
+        direction,
+        simulateDays: 1,
+      });
+
+      opportunities.push({
+        symbol,
+        varPrice: varAsset.price,
+        binancePrice: binanceData.markPrice,
+        varRate: varAsset.fundingRate,
+        varInterval: varAsset.fundingIntervalSeconds,
+        var8hRate,
+        varAnnualRate,
+        varFundingTime: varAsset.fundingTime,
+        binanceRate: binanceData.fundingRate,
+        binanceInterval: binanceData.fundingIntervalSeconds,
+        binance8hRate,
+        binanceAnnualRate,
+        binanceFundingTime: binanceData.fundingTime,
+        rateDiff8h: rateDiff,
+        annualDiff,
+        strategy,
+        direction,
+        profit,
+        timeline,
+        volume24h: varAsset.volume24h,
+      });
+    } catch (calcErr) {
+      console.error(`[DATA] 处理交易对 ${varAsset.symbol} 失败: ${calcErr.message}`);
     }
-
-    const profit = calculateArbitrageProfit({
-      varRate: varAsset.fundingRate,
-      varInterval: varAsset.fundingIntervalSeconds,
-      binanceRate: binanceData.fundingRate,
-      binanceInterval: binanceData.fundingIntervalSeconds,
-      positionSize: 10000,
-      holdingDays: 1,
-    });
-
-    const timeline = generateArbitrageTimeline({
-      varPrice: varAsset.price,
-      binancePrice: binanceData.markPrice,
-      varRate: varAsset.fundingRate,
-      varInterval: varAsset.fundingIntervalSeconds,
-      binanceRate: binanceData.fundingRate,
-      binanceInterval: binanceData.fundingIntervalSeconds,
-      direction,
-      simulateDays: 1,
-    });
-
-    opportunities.push({
-      symbol,
-      varPrice: varAsset.price,
-      binancePrice: binanceData.markPrice,
-      varRate: varAsset.fundingRate,
-      varInterval: varAsset.fundingIntervalSeconds,
-      var8hRate,
-      varAnnualRate,
-      varFundingTime: varAsset.fundingTime,
-      binanceRate: binanceData.fundingRate,
-      binanceInterval: binanceData.fundingIntervalSeconds,
-      binance8hRate,
-      binanceAnnualRate,
-      binanceFundingTime: binanceData.fundingTime,
-      rateDiff8h: rateDiff,
-      annualDiff,
-      strategy,
-      direction,
-      profit,
-      timeline,
-      volume24h: varAsset.volume24h,
-    });
   }
 
   opportunities.sort((a, b) => Math.abs(b.annualDiff) - Math.abs(a.annualDiff));
@@ -457,33 +542,75 @@ function generateTimelineRows(timeline) {
 }
 
 function handleRequest(req, res) {
-  if (req.url === '/' || req.url === '/index.html') {
-    fetchArbitrageData()
-      .then(data => {
-        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        res.end(generateHTML(data));
-      })
-      .catch(err => {
+  // 请求级别错误处理
+  try {
+    // 设置超时
+    req.setTimeout(30000);
+    res.setTimeout(30000);
+
+    req.on('error', (err) => {
+      console.error(`[HTTP] 请求错误: ${err.message}`);
+    });
+
+    res.on('error', (err) => {
+      console.error(`[HTTP] 响应错误: ${err.message}`);
+    });
+
+    if (req.url === '/' || req.url === '/index.html') {
+      fetchArbitrageData()
+        .then(data => {
+          if (res.writableEnded) return;
+          res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+          res.end(generateHTML(data));
+        })
+        .catch(err => {
+          console.error(`[HTTP] 页面渲染失败: ${err.message}`);
+          if (res.writableEnded) return;
+          res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('服务暂时不可用，请稍后重试: ' + err.message);
+        });
+    } else if (req.url === '/api/data') {
+      fetchArbitrageData()
+        .then(data => {
+          if (res.writableEnded) return;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            opportunities: data,
+            varRefreshTime: lastVarRefreshTime ? lastVarRefreshTime.toISOString() : null,
+            binanceRefreshTime: lastBinanceRefreshTime ? lastBinanceRefreshTime.toISOString() : null,
+          }));
+        })
+        .catch(err => {
+          console.error(`[HTTP] API请求失败: ${err.message}`);
+          if (res.writableEnded) return;
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: err.message }));
+        });
+    } else if (req.url === '/health') {
+      // 健康检查端点
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        status: 'ok',
+        uptime: process.uptime(),
+        memory: process.memoryUsage(),
+        cachedData: cachedData ? cachedData.length : 0,
+        lastVarRefresh: lastVarRefreshTime ? lastVarRefreshTime.toISOString() : null,
+        lastBinanceRefresh: lastBinanceRefreshTime ? lastBinanceRefreshTime.toISOString() : null,
+      }));
+    } else {
+      res.writeHead(404);
+      res.end('Not Found');
+    }
+  } catch (err) {
+    console.error(`[HTTP] 请求处理异常: ${err.message}`);
+    try {
+      if (!res.writableEnded) {
         res.writeHead(500, { 'Content-Type': 'text/plain' });
-        res.end('Error: ' + err.message);
-      });
-  } else if (req.url === '/api/data') {
-    fetchArbitrageData()
-      .then(data => {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          opportunities: data,
-          varRefreshTime: lastVarRefreshTime ? lastVarRefreshTime.toISOString() : null,
-          binanceRefreshTime: lastBinanceRefreshTime ? lastBinanceRefreshTime.toISOString() : null,
-        }));
-      })
-      .catch(err => {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: err.message }));
-      });
-  } else {
-    res.writeHead(404);
-    res.end('Not Found');
+        res.end('Internal Server Error');
+      }
+    } catch (e) {
+      // 忽略响应写入错误
+    }
   }
 }
 
@@ -493,39 +620,95 @@ async function refreshDataPeriodically() {
     // 强制刷新缓存
     lastFetchTime = 0;
     const opportunities = await fetchArbitrageData();
-    console.log(`[AUTO] 数据刷新完成 - ${new Date().toLocaleTimeString()}`);
+    console.log(`[AUTO] 数据刷新完成 - ${new Date().toLocaleTimeString()}, 共 ${opportunities.length} 个交易对`);
 
-    // 处理 Telegram 机器人通知
-    await checkAndNotify(opportunities);
-    await handleListRequests(opportunities);
+    // 处理 Telegram 机器人通知 - 单独 try-catch 防止影响主流程
+    try {
+      await checkAndNotify(opportunities);
+    } catch (notifyErr) {
+      console.error(`[AUTO] Telegram通知失败: ${notifyErr.message}`);
+    }
+
+    try {
+      await handleListRequests(opportunities);
+    } catch (listErr) {
+      console.error(`[AUTO] 处理列表请求失败: ${listErr.message}`);
+    }
   } catch (err) {
     console.error(`[AUTO] 定时刷新失败: ${err.message}`);
+    // 不抛出错误，确保定时任务继续运行
   }
 }
 
 async function main() {
-  console.log('等待浏览器连接...\n');
-  await waitForBrowser(120000);
-  console.log('浏览器已连接!\n');
+  // 等待浏览器连接 - 无限重试
+  while (true) {
+    try {
+      console.log('等待浏览器连接...\n');
+      await waitForBrowser(120000);
+      console.log('浏览器已连接!\n');
+      break;
+    } catch (err) {
+      console.error(`[MAIN] 浏览器连接失败: ${err.message}，5秒后重试...`);
+      await new Promise(r => setTimeout(r, 5000));
+    }
+  }
 
-  // 启动 Telegram 机器人
-  startBot();
+  // 启动 Telegram 机器人 - 捕获错误防止崩溃
+  try {
+    startBot();
+  } catch (botErr) {
+    console.error(`[MAIN] Telegram机器人启动失败: ${botErr.message}`);
+  }
 
-  // 初始拉取一次数据
-  await refreshDataPeriodically();
+  // 初始拉取一次数据 - 失败不阻止服务启动
+  try {
+    await refreshDataPeriodically();
+  } catch (err) {
+    console.error(`[MAIN] 初始数据拉取失败: ${err.message}`);
+  }
 
   // 启动定时刷新
   setInterval(refreshDataPeriodically, AUTO_REFRESH_INTERVAL);
   console.log(`[AUTO] 已启动定时刷新，间隔: ${AUTO_REFRESH_INTERVAL / 1000}秒\n`);
 
   const server = createServer(handleRequest);
+
+  // HTTP服务器错误处理
+  server.on('error', (err) => {
+    console.error(`[HTTP] 服务器错误: ${err.message}`);
+    if (err.code === 'EADDRINUSE') {
+      console.error(`[HTTP] 端口 ${HTTP_PORT} 已被占用，10秒后重试...`);
+      setTimeout(() => {
+        server.close();
+        server.listen(HTTP_PORT);
+      }, 10000);
+    }
+  });
+
+  server.on('clientError', (err, socket) => {
+    console.error(`[HTTP] 客户端错误: ${err.message}`);
+    if (socket.writable) {
+      socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+    }
+  });
+
   server.listen(HTTP_PORT, () => {
     console.log(`HTTP 服务已启动: http://localhost:${HTTP_PORT}`);
     console.log('按 Ctrl+C 退出');
   });
 }
 
-main().catch(err => {
-  console.error('Error:', err.message);
-  process.exit(1);
-});
+// 主函数启动 - 带自动重启
+(async function bootstrap() {
+  while (true) {
+    try {
+      await main();
+      break; // main 正常运行（不会到达这里，因为 server.listen 会阻塞）
+    } catch (err) {
+      console.error(`[BOOTSTRAP] 主函数异常: ${err.message}`);
+      console.error('[BOOTSTRAP] 10秒后重启...');
+      await new Promise(r => setTimeout(r, 10000));
+    }
+  }
+})();
