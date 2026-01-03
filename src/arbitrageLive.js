@@ -298,6 +298,10 @@ function generateHTML(opportunities) {
     .strategy { font-size: 11px; color: #ff0; }
     .none { color: #666; }
     .info { text-align: center; margin-bottom: 10px; color: #888; font-size: 12px; }
+    .filter-tabs { text-align: center; margin-bottom: 15px; }
+    .filter-tabs .tab { padding: 8px 20px; margin: 0 5px; background: #16213e; border: 1px solid #333; color: #888; cursor: pointer; font-size: 13px; transition: all 0.2s; }
+    .filter-tabs .tab:hover { border-color: #0f0; color: #0f0; }
+    .filter-tabs .tab.active { background: #0f0; color: #1a1a2e; border-color: #0f0; font-weight: bold; }
     .expand-icon { margin-right: 8px; transition: transform 0.2s; display: inline-block; }
     .expanded .expand-icon { transform: rotate(90deg); }
     .timeline-row { display: none; }
@@ -326,6 +330,11 @@ function generateHTML(opportunities) {
     共 <span id="pair-count">${opportunities.length}</span> 个交易对 |
     <span id="countdown">30</span>秒后刷新 | 点击行查看时间线详情
   </div>
+  <div class="filter-tabs">
+    <button class="tab active" data-filter="all" onclick="setFilter('all')">全部</button>
+    <button class="tab" data-filter="long" onclick="setFilter('long')">VAR开多</button>
+    <button class="tab" data-filter="short" onclick="setFilter('short')">VAR开空</button>
+  </div>
   <div class="search">
     <input type="text" id="search" placeholder="搜索交易对..." onkeyup="filter()">
   </div>
@@ -349,7 +358,7 @@ function generateHTML(opportunities) {
         const hasOpp = o.direction !== 'NONE';
         const varIntervalText = formatIntervalShort(o.varInterval);
         const binanceIntervalText = formatIntervalShort(o.binanceInterval);
-        return `<tr class="main-row ${isHot ? 'hot' : ''}" data-symbol="${o.symbol.toLowerCase()}" data-idx="${idx}" onclick="toggleTimeline(${idx})">
+        return `<tr class="main-row ${isHot ? 'hot' : ''}" data-symbol="${o.symbol.toLowerCase()}" data-direction="${o.direction}" data-idx="${idx}" onclick="toggleTimeline(${idx})">
           <td><span class="expand-icon">▶</span><strong>${o.symbol}</strong></td>
           <td>$${o.varPrice.toFixed(4)}</td>
           <td>$${o.binancePrice.toFixed(4)}</td>
@@ -406,12 +415,29 @@ function generateHTML(opportunities) {
     const REFRESH_INTERVAL = 30; // 前端每30秒拉取一次缓存
     let countdown = REFRESH_INTERVAL;
     let allData = [];
+    let currentFilter = 'all';
+
+    function setFilter(filterType) {
+      currentFilter = filterType;
+      document.querySelectorAll('.filter-tabs .tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.filter === filterType);
+      });
+      filter();
+    }
 
     function filter() {
       const q = document.getElementById('search').value.toLowerCase();
       const rows = document.querySelectorAll('#table tbody tr.main-row');
       rows.forEach(row => {
-        const show = row.dataset.symbol.includes(q);
+        const matchSearch = row.dataset.symbol.includes(q);
+        const direction = row.dataset.direction;
+        let matchFilter = true;
+        if (currentFilter === 'long') {
+          matchFilter = direction === 'SHORT_BINANCE';
+        } else if (currentFilter === 'short') {
+          matchFilter = direction === 'SHORT_VAR';
+        }
+        const show = matchSearch && matchFilter;
         row.style.display = show ? '' : 'none';
         const timelineRow = document.getElementById('timeline-' + row.dataset.idx);
         if (!show) timelineRow.classList.remove('show');
@@ -454,7 +480,7 @@ function generateHTML(opportunities) {
         const hasOpp = o.direction !== 'NONE';
         const varIntervalText = formatIntervalShort(o.varInterval);
         const binanceIntervalText = formatIntervalShort(o.binanceInterval);
-        return '<tr class="main-row ' + (isHot ? 'hot' : '') + '" data-symbol="' + o.symbol.toLowerCase() + '" data-idx="' + idx + '" onclick="toggleTimeline(' + idx + ')">' +
+        return '<tr class="main-row ' + (isHot ? 'hot' : '') + '" data-symbol="' + o.symbol.toLowerCase() + '" data-direction="' + o.direction + '" data-idx="' + idx + '" onclick="toggleTimeline(' + idx + ')">' +
           '<td><span class="expand-icon">▶</span><strong>' + o.symbol + '</strong></td>' +
           '<td>$' + o.varPrice.toFixed(4) + '</td>' +
           '<td>$' + o.binancePrice.toFixed(4) + '</td>' +
